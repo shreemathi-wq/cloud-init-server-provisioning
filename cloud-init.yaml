@@ -1,0 +1,114 @@
+﻿#cloud-config
+
+# -----------------------------------------------------------------------------
+# bootcmd - runs on EVERY boot, before almost everything else.
+# Only use this for tasks that must happen early on every boot.
+# We use it here specifically because write_files needs the parent directory
+# to already exist. mkdir -p is idempotent so re-running on every boot is safe.
+# -----------------------------------------------------------------------------
+bootcmd:
+  - mkdir -p /opt/testpress
+
+# -----------------------------------------------------------------------------
+# Update the apt package index on first boot.
+# -----------------------------------------------------------------------------
+package_update: true
+
+# -----------------------------------------------------------------------------
+# Install required packages.
+# cloud-init installs these after package_update and before runcmd.
+# -----------------------------------------------------------------------------
+packages:
+  - docker.io
+  - git
+  - curl
+  - ffmpeg
+
+# -----------------------------------------------------------------------------
+# Create users.
+# NOTE: The users module runs AFTER write_files in cloud-init's execution
+# order. This means write_files cannot safely set owner: testpress:testpress
+# because the testpress user does not yet exist at that point.
+# Files that belong to testpress are written as root:root here and then
+# explicitly chowned to testpress inside runcmd (which runs after users).
+# -----------------------------------------------------------------------------
+users:
+  - default
+  - name: testpress
+    shell: /bin/bash
+    groups: [docker]
+    lock_passwd: true
+
+# -----------------------------------------------------------------------------
+# Write application files and the systemd unit.
+# All files owned by testpress are set to root:root at this stage (see note
+# in users section). Ownership is corrected in runcmd after the testpress
+# user is created.
+# -----------------------------------------------------------------------------
+write_files:
+  - path: /opt/testpress/app.env
+    owner: root:root
+    permissions: '0640'
+    content: |
+      APP_NAME=Testpress
+      APP_ENV=development
+      APP_PORT=8080
+
+  - path: /opt/testpress/index.html
+    owner: root:root
+    permissions: '0644'
+    content: |
+      Hello from Testpress!
+
+  - path: /etc/systemd/system/testpress.service
+    owner: root:root
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=Testpress Docker Application
+      Requires=docker.service
+      After=docker.service network-online.target
+      Wants=network-online.target
+
+      [Service]
+      Restart=always
+      RestartSec=5
+      TimeoutStartSec=300
+      ExecStartPre=-/usr/bin/docker rm -f testpress-web
+      ExecStart=/usr/bin/docker run \
+        --name testpress-web \
+        --publish 8080:80 \
+        --env-file /opt/testpress/app.env \
+        --volume /opt/testpress/index.html:/usr/share/nginx/html/index.html:ro \
+        --health-cmd="wget -qO- http://localhost:80 || exit 1" \
+        --health-interval=30s \
+        --health-retries=3 \
+        nginx:alpine
+      ExecStop=/usr/bin/docker stop testpress-web
+      ExecStopPost=-/usr/bin/docker rm -f testpress-web
+
+      [Install]
+      WantedBy=multi-user.target
+
+# -----------------------------------------------------------------------------
+# runcmd - runs ONCE on first boot only, after packages and users are ready.
+# Order matters: docker must be running before we enable testpress.service.
+# -----------------------------------------------------------------------------
+runcmd:
+  # Correct ownership of application files now that testpress user exists
+  - chown testpress:testpress /opt/testpress
+  - chown testpress:testpress /opt/testpress/app.env
+  - chown testpress:testpress /opt/testpress/index.html
+
+  # Ensure testpress is in the docker group (belt-and-suspenders alongside
+  # the declarative groups key above)
+  - usermod -aG docker testpress
+
+  # Start and enable Docker before anything depends on it
+  - systemctl enable --now docker
+
+  # Reload systemd so it picks up the new testpress.service unit file
+  - systemctl daemon-reload
+
+  # Enable and start the application service
+  - systemctl enable --now testpress.service
