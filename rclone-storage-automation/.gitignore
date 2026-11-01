@@ -1,0 +1,10 @@
+# Real credentials
+.env
+
+# Generated test data, experiment folders and logs (large, reproducible)
+sample-data/
+sample-data-large/
+storage-a/
+storage-b/
+downloads/
+logs/
