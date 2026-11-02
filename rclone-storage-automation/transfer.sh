@@ -1,109 +1,103 @@
 #!/usr/bin/env bash
-# Reusable file transfer script built on rclone.
+# ==============================================================================
+# Testpress DevOps File Transfer & Synchronization Utility
+# Testpress Engineering
 #
 # Usage:
-#   ./transfer.sh copy <source> <destination> [rclone flags...]
-#   ./transfer.sh sync <source> <destination> [--confirm] [rclone flags...]
+#   ./transfer.sh copy <source> <destination> [rclone options...]
+#   ./transfer.sh sync <source> <destination> [--confirm] [rclone options...]
 #
 # Examples:
 #   ./transfer.sh copy sample-data :s3:main-bucket/uploads
-#   ./transfer.sh copy sample-data-large :s3:main-bucket/large --bwlimit 30M
-#   ./transfer.sh sync storage-a/v2 :s3:main-bucket/site             # preview only
-#   ./transfer.sh sync storage-a/v2 :s3:main-bucket/site --confirm   # real sync
+#   ./transfer.sh copy sample-data-large :s3:main-bucket/large --bwlimit 50M
+#   ./transfer.sh sync sample-data :s3:main-bucket/site             # Preview only
+#   ./transfer.sh sync sample-data :s3:main-bucket/site --confirm   # Live sync
 #
-# S3 paths use rclone's on-the-fly remote ":s3:bucket/path". The script never
-# reads an rclone config file. S3 settings come only from environment variables:
-#   RCLONE_S3_ACCESS_KEY_ID      (required for :s3: paths)
-#   RCLONE_S3_SECRET_ACCESS_KEY  (required for :s3: paths)
-#   RCLONE_S3_PROVIDER           (for example Minio, AWS, Wasabi)
-#   RCLONE_S3_ENDPOINT           (not needed for AWS)
+# Environment Variables:
+#   RCLONE_S3_ACCESS_KEY_ID      (Required for :s3: paths)
+#   RCLONE_S3_SECRET_ACCESS_KEY  (Required for :s3: paths)
+#   RCLONE_S3_PROVIDER           (e.g., Minio, AWS, Wasabi)
+#   RCLONE_S3_ENDPOINT           (e.g., http://127.0.0.1:9000)
 #
-# Optional settings:
-#   LOG_DIR           where log files are written (default: ./logs next to this script)
-#   MAX_DELETE        sync stops after this many deletes (default: 100)
-#   SYNC_BACKUP_DIR   sync moves deleted/overwritten files here instead of destroying them
+# Optional Overrides:
+#   LOG_DIR           Directory for execution logs (Default: ./logs)
+#   MAX_DELETE        Safety limit on sync file deletions (Default: 100)
+#   SYNC_BACKUP_DIR   Rollback archive path for modified/deleted files
 #
-# Exit codes:
-#   0      success
-#   2      wrong usage or missing configuration
-#   other  rclone's exit code (see "Exit Code" in https://rclone.org/docs/)
+# Exit Codes:
+#   0      Transfer completed and verified
+#   2      Command usage error or missing configuration
+#   other  Rclone process error code
+# ==============================================================================
 
 set -euo pipefail
 
-# ---------------------------------------------------------------------------
-# Settings
-# ---------------------------------------------------------------------------
-
+# ------------------------------------------------------------------------------
+# Core Settings
+# ------------------------------------------------------------------------------
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly LOG_DIR="${LOG_DIR:-${SCRIPT_DIR}/logs}"
 readonly MAX_DELETE="${MAX_DELETE:-100}"
 readonly EXIT_USAGE=2
 
-# Never read a saved rclone config file. Everything comes from arguments and env vars.
+# Enforce stateless execution: do not touch ~/.config/rclone/rclone.conf
 export RCLONE_CONFIG=/dev/null
 
-# Retry settings learned from the experiments in section 5.
+# Reliability & retry policies
 readonly RETRY_FLAGS=(--retries 3 --retries-sleep 10s --low-level-retries 10)
 
-# Live progress bar on a terminal; periodic stats in the log when run from
-# cron or another program (no terminal). Do not combine --progress with
-# --stats 30s: the progress bar would then refresh only every 30 seconds.
+# Terminal detection: dynamic progress on TTY; periodic telemetry in automation
 if [[ -t 1 ]]; then
   readonly PROGRESS_FLAGS=(--progress)
 else
   readonly PROGRESS_FLAGS=(--stats 30s)
 fi
 
-# sync deletes files, so it always gets a delete limit and an optional backup folder.
+# Sync safety flags
 SYNC_SAFETY_FLAGS=(--max-delete "${MAX_DELETE}")
 if [[ -n "${SYNC_BACKUP_DIR:-}" ]]; then
   SYNC_SAFETY_FLAGS+=(--backup-dir "${SYNC_BACKUP_DIR}")
 fi
 readonly SYNC_SAFETY_FLAGS
 
-# ---------------------------------------------------------------------------
-# Main flow
-# ---------------------------------------------------------------------------
-
+# ------------------------------------------------------------------------------
+# Main Flow
+# ------------------------------------------------------------------------------
 main() {
   parse_arguments "$@"
-
   validate_operation "${OPERATION}"
   reject_dry_run_flag "${EXTRA_FLAGS[@]}"
   reject_inline_credentials "${SOURCE}" "${DESTINATION}"
   require_s3_credentials_for_s3_paths "${SOURCE}" "${DESTINATION}"
-  create_log_file "${OPERATION}"
+  initialize_log_file "${OPERATION}"
 
-  log_message "Started: ${OPERATION} '${SOURCE}' -> '${DESTINATION}'"
+  log_info "Starting ${OPERATION^^} job: '${SOURCE}' -> '${DESTINATION}'"
 
   case "${OPERATION}" in
     copy)
-      run_copy "${SOURCE}" "${DESTINATION}" "${EXTRA_FLAGS[@]}"
-      verify_copy "${SOURCE}" "${DESTINATION}"
+      execute_copy "${SOURCE}" "${DESTINATION}" "${EXTRA_FLAGS[@]}"
+      verify_copy_integrity "${SOURCE}" "${DESTINATION}"
       ;;
     sync)
       if [[ "${SYNC_CONFIRMED}" == "no" ]]; then
-        preview_sync "${SOURCE}" "${DESTINATION}" "${EXTRA_FLAGS[@]}"
-        log_message "Preview only. Nothing was changed. Re-run with --confirm to sync."
+        execute_sync_preview "${SOURCE}" "${DESTINATION}" "${EXTRA_FLAGS[@]}"
+        log_info "Preview complete. No changes made. Re-run with --confirm to apply synchronization."
         exit 0
       fi
-      run_sync "${SOURCE}" "${DESTINATION}" "${EXTRA_FLAGS[@]}"
-      verify_sync "${SOURCE}" "${DESTINATION}"
+      execute_sync "${SOURCE}" "${DESTINATION}" "${EXTRA_FLAGS[@]}"
+      verify_sync_integrity "${SOURCE}" "${DESTINATION}"
       ;;
   esac
 
-  log_message "Finished successfully. Log: ${LOG_FILE}"
+  print_summary
 }
 
-# ---------------------------------------------------------------------------
-# Arguments and validation
-# ---------------------------------------------------------------------------
-
-# Sets OPERATION, SOURCE, DESTINATION, SYNC_CONFIRMED and EXTRA_FLAGS.
-# Every argument after the destination is passed to rclone, except --confirm.
+# ------------------------------------------------------------------------------
+# Argument Parsing & Validation
+# ------------------------------------------------------------------------------
 parse_arguments() {
   if [[ $# -lt 3 ]]; then
-    print_usage
+    print_usage_banner
     exit "${EXIT_USAGE}"
   fi
 
@@ -114,65 +108,67 @@ parse_arguments() {
 
   SYNC_CONFIRMED="no"
   EXTRA_FLAGS=()
-  local arg
-  for arg in "$@"; do
-    if [[ "${arg}" == "--confirm" ]]; then
+  local flag
+  for flag in "$@"; do
+    if [[ "${flag}" == "--confirm" ]]; then
       SYNC_CONFIRMED="yes"
     else
-      EXTRA_FLAGS+=("${arg}")
+      EXTRA_FLAGS+=("${flag}")
     fi
   done
 
   readonly OPERATION SOURCE DESTINATION SYNC_CONFIRMED EXTRA_FLAGS
 }
 
-print_usage() {
+print_usage_banner() {
   cat >&2 <<EOF
+================================================================================
+Testpress File Transfer Utility (Rclone Engine)
+================================================================================
 Usage:
-  $(basename "$0") copy <source> <destination> [rclone flags...]
-  $(basename "$0") sync <source> <destination> [--confirm] [rclone flags...]
+  $(basename "$0") copy <source> <destination> [rclone options...]
+  $(basename "$0") sync <source> <destination> [--confirm] [rclone options...]
 
-sync without --confirm only shows what would change (dry run).
-S3 paths look like :s3:bucket/path and need RCLONE_S3_* environment variables.
+Notes:
+  - sync defaults to dry-run preview unless --confirm is specified.
+  - S3 paths use :s3:bucket/path and read credentials from RCLONE_S3_* env vars.
+  - No static rclone.conf is ever created or modified.
+================================================================================
 EOF
 }
 
 validate_operation() {
-  local operation="$1"
-  if [[ "${operation}" != "copy" && "${operation}" != "sync" ]]; then
-    echo "Error: unknown operation '${operation}'. Use 'copy' or 'sync'." >&2
-    print_usage
+  local op="$1"
+  if [[ "${op}" != "copy" && "${op}" != "sync" ]]; then
+    log_error "Unsupported operation '${op}'. Supported operations: 'copy', 'sync'."
+    print_usage_banner
     exit "${EXIT_USAGE}"
   fi
 }
 
-# A dry-run copy changes nothing, so the verification afterwards would always
-# fail. Previews are done with "sync" without --confirm instead.
 reject_dry_run_flag() {
-  local flag
-  for flag in "$@"; do
-    if [[ "${flag}" == "--dry-run" || "${flag}" == "-n" ]]; then
-      echo "Error: --dry-run is not supported. Run 'sync' without --confirm to preview." >&2
+  local arg
+  for arg in "$@"; do
+    if [[ "${arg}" == "--dry-run" || "${arg}" == "-n" ]]; then
+      log_error "Manual --dry-run flag is prohibited. Run 'sync' without --confirm to preview."
       exit "${EXIT_USAGE}"
     fi
   done
 }
 
-# Passwords inside the path (":s3,secret_access_key=...:") are visible in `ps`
-# and shell history, so they are refused. Use environment variables instead.
 reject_inline_credentials() {
-  local path
-  for path in "$@"; do
-    if [[ "${path}" == *secret_access_key=* || "${path}" == *access_key_id=* ]]; then
-      echo "Error: do not put credentials in the path. Use RCLONE_S3_* environment variables." >&2
+  local endpoint
+  for endpoint in "$@"; do
+    if [[ "${endpoint}" == *secret_access_key=* || "${endpoint}" == *access_key_id=* ]]; then
+      log_error "Inline credentials detected in path string. Use RCLONE_S3_* environment variables instead."
       exit "${EXIT_USAGE}"
     fi
   done
 }
 
 require_s3_credentials_for_s3_paths() {
-  local source="$1" destination="$2"
-  if ! is_s3_path "${source}" && ! is_s3_path "${destination}"; then
+  local src="$1" dst="$2"
+  if ! is_s3_path "${src}" && ! is_s3_path "${dst}"; then
     return
   fi
 
@@ -181,112 +177,114 @@ require_s3_credentials_for_s3_paths() {
   [[ -z "${RCLONE_S3_SECRET_ACCESS_KEY:-}" ]] && missing+=(RCLONE_S3_SECRET_ACCESS_KEY)
 
   if [[ ${#missing[@]} -gt 0 ]]; then
-    echo "Error: S3 path used, but these environment variables are not set: ${missing[*]}" >&2
+    log_error "S3 path detected but mandatory environment variables are unset: ${missing[*]}"
     exit "${EXIT_USAGE}"
   fi
 }
 
 is_s3_path() {
-  local path="$1"
-  [[ "${path}" == :s3:* || "${path}" == :s3,* ]]
+  local target="$1"
+  [[ "${target}" == :s3:* || "${target}" == :s3,* ]]
 }
 
-# ---------------------------------------------------------------------------
-# Transfers
-# ---------------------------------------------------------------------------
-
-run_copy() {
-  local source="$1" destination="$2"
+# ------------------------------------------------------------------------------
+# Transfer Operations
+# ------------------------------------------------------------------------------
+execute_copy() {
+  local src="$1" dst="$2"
   shift 2
-  run_rclone_with_logging copy "${source}" "${destination}" "${RETRY_FLAGS[@]}" "$@"
+  invoke_rclone copy "${src}" "${dst}" "${RETRY_FLAGS[@]}" "$@"
 }
 
-# Shows the preview on screen as well as in the log, so the user can read
-# what would be copied and deleted before confirming.
-preview_sync() {
-  local source="$1" destination="$2"
+execute_sync_preview() {
+  local src="$1" dst="$2"
   shift 2
-  log_message "Dry run: showing what sync would copy and delete"
+  log_info "Generating dry-run preview of planned changes (no disk modifications)..."
 
-  rclone sync "${source}" "${destination}" --dry-run "${SYNC_SAFETY_FLAGS[@]}" "$@" 2>&1 \
+  rclone sync "${src}" "${dst}" --dry-run "${SYNC_SAFETY_FLAGS[@]}" "$@" 2>&1 \
     | tee -a "${LOG_FILE}"
-  local status="${PIPESTATUS[0]}"
+  local exit_status="${PIPESTATUS[0]}"
 
-  if [[ "${status}" -ne 0 ]]; then
-    exit_with_failure "Dry run FAILED (exit code ${status})" "${status}"
+  if [[ "${exit_status}" -ne 0 ]]; then
+    terminate_with_error "Dry-run preview failed with exit code ${exit_status}" "${exit_status}"
   fi
 }
 
-run_sync() {
-  local source="$1" destination="$2"
+execute_sync() {
+  local src="$1" dst="$2"
   shift 2
-  run_rclone_with_logging sync "${source}" "${destination}" \
-    "${RETRY_FLAGS[@]}" "${SYNC_SAFETY_FLAGS[@]}" "$@"
+  invoke_rclone sync "${src}" "${dst}" "${RETRY_FLAGS[@]}" "${SYNC_SAFETY_FLAGS[@]}" "$@"
 }
 
-# Runs rclone with a progress display on screen and its detailed log in
-# LOG_FILE. On failure, shows the last errors and exits with rclone's exit code.
-run_rclone_with_logging() {
-  local rclone_command="$1"
+invoke_rclone() {
+  local cmd="$1"
   local status=0
-  rclone "$@" "${PROGRESS_FLAGS[@]}" --log-file "${LOG_FILE}" --log-level INFO \
-    || status=$?
+  rclone "$@" "${PROGRESS_FLAGS[@]}" --log-file "${LOG_FILE}" --log-level INFO || status=$?
 
   if [[ "${status}" -ne 0 ]]; then
     grep -E "ERROR|Failed" "${LOG_FILE}" | tail -n 5 >&2 || true
-    exit_with_failure "rclone ${rclone_command} FAILED (exit code ${status}). Last errors are shown above." "${status}"
+    terminate_with_error "rclone ${cmd} failed with exit code ${status}. Check log for details." "${status}"
   fi
 }
 
-# ---------------------------------------------------------------------------
-# Verification
-# ---------------------------------------------------------------------------
-
-# copy never deletes, so extra files in the destination are fine (--one-way).
-verify_copy() {
-  local source="$1" destination="$2"
-  log_message "Verifying: every source file must exist and match in the destination"
-  run_rclone_check "${source}" "${destination}" --one-way
+# ------------------------------------------------------------------------------
+# Integrity Verification (rclone check)
+# ------------------------------------------------------------------------------
+verify_copy_integrity() {
+  local src="$1" dst="$2"
+  log_audit "Verifying copy: checking that all source files match in destination (--one-way)..."
+  run_check_audit "${src}" "${dst}" --one-way
 }
 
-# After sync, both sides must be exactly the same.
-verify_sync() {
-  local source="$1" destination="$2"
-  log_message "Verifying: source and destination must be identical"
-  run_rclone_check "${source}" "${destination}"
+verify_sync_integrity() {
+  local src="$1" dst="$2"
+  log_audit "Verifying sync: ensuring source and destination are 100% identical..."
+  run_check_audit "${src}" "${dst}"
 }
 
-run_rclone_check() {
-  local status=0
-  rclone check "$@" --log-file "${LOG_FILE}" --log-level NOTICE || status=$?
+run_check_audit() {
+  local check_status=0
+  rclone check "$@" --log-file "${LOG_FILE}" --log-level NOTICE || check_status=$?
 
-  if [[ "${status}" -ne 0 ]]; then
-    exit_with_failure "Verification FAILED (exit code ${status}). See ${LOG_FILE}" "${status}"
+  if [[ "${check_status}" -ne 0 ]]; then
+    terminate_with_error "Verification audit FAILED with exit code ${check_status}. Review ${LOG_FILE}" "${check_status}"
   fi
-  log_message "Verification passed"
+  log_audit "Integrity verification PASSED."
 }
 
-# ---------------------------------------------------------------------------
-# Logging and exit
-# ---------------------------------------------------------------------------
-
-create_log_file() {
-  local operation="$1"
+# ------------------------------------------------------------------------------
+# Logging & Process Utilities
+# ------------------------------------------------------------------------------
+initialize_log_file() {
+  local action="$1"
   mkdir -p "${LOG_DIR}"
-  # The process ID keeps two runs in the same second from sharing a log file.
-  LOG_FILE="${LOG_DIR}/transfer-${operation}-$(date +%Y%m%d-%H%M%S)-$$.log"
+  LOG_FILE="${LOG_DIR}/transfer-${action}-$(date +%Y%m%d-%H%M%S)-$$.log"
   readonly LOG_FILE
 }
 
-# Prints a timestamped message to the screen and appends it to the log file.
-log_message() {
-  echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "${LOG_FILE}" >&2
+log_info() {
+  echo "[INFO]  [$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "${LOG_FILE}" >&2
 }
 
-exit_with_failure() {
-  local message="$1" status="$2"
-  log_message "${message}"
-  exit "${status}"
+log_audit() {
+  echo "[AUDIT] [$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "${LOG_FILE}" >&2
+}
+
+log_error() {
+  echo "[ERROR] [$(date '+%Y-%m-%d %H:%M:%S')] $*" >&2
+}
+
+terminate_with_error() {
+  local err_msg="$1" err_code="$2"
+  log_error "${err_msg}"
+  exit "${err_code}"
+}
+
+print_summary() {
+  echo "--------------------------------------------------------------------------------"
+  echo "Job Status: SUCCESS (Verified)"
+  echo "Log File:   ${LOG_FILE}"
+  echo "--------------------------------------------------------------------------------"
 }
 
 main "$@"
